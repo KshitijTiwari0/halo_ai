@@ -731,7 +731,7 @@ def load_css():
         border: none !important;
         border-radius: 50% !important;
         width: 60px !important;
-        height: 60px ! 
+        height: 60px !important;
         font-size: 1.5rem !important;
         color: white !important;
         margin: 2rem auto !important;
@@ -823,7 +823,7 @@ def main():
         try:
             st.session_state.page = 'main'
             logger.info("Login successful, navigating to main page")
-            st.rerun()
+            st.experimental_rerun()
         except Exception as e:
             logger.error(f"Login error: {e}")
             st.error(f"Login failed: {e}")
@@ -895,7 +895,7 @@ def main():
             with col2:
                 if st.button("🎙️", key="record_button", disabled=st.session_state.recording_active):
                     st.session_state.recording_active = True
-                    st.rerun()
+                    st.experimental_rerun()
             
             if st.session_state.recording_active:
                 with st.spinner("Recording... Speak now!"):
@@ -925,13 +925,13 @@ def main():
                             st.error("❌ No audio captured. Check your microphone.")
                         
                         time.sleep(1)
-                        st.rerun()
+                        st.experimental_rerun()
                         
                     except Exception as e:
                         logger.error(f"Recording error: {e}")
                         st.error(f"Recording failed: {e}")
                         st.session_state.recording_active = False
-                        st.rerun()
+                        st.experimental_rerun()
             
             st.markdown('</div>', unsafe_allow_html=True)
             
@@ -940,14 +940,14 @@ def main():
             st.error(f"Page loading failed: {e}")
             if st.button("Back to Login"):
                 st.session_state.page = 'login'
-                st.rerun()
+                st.experimental_rerun()
     
     else:
         # Fallback - should not happen but just in case
         st.error("Unknown page state")
         if st.button("Go to Login"):
             st.session_state.page = 'login'
-            st.rerun()
+            st.experimental_rerun()
 
 if __name__ == "__main__":
     main()
