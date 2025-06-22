@@ -16,6 +16,7 @@ from scipy.stats import skew, kurtosis
 from retrying import retry
 from io import BytesIO
 import base64
+from pydub import AudioSegment
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -28,7 +29,7 @@ class ConfigManager:
         self.config_file = config_file
         self.config = {
             "voice_id": "21m00Tcm4TlvDq8ikWAM",
-            "silence_threshold": 0.01,
+            "silence_threshold": 0.005,
             "max_duration": 10,
             "transcription_method": "whisper"
         }
@@ -45,11 +46,13 @@ class ConfigManager:
     
     def save_config(self):
         try:
-            # Exclude API keys from being saved to the file
             config_to_save = {k: v for k, v in self.config.items() if k not in ["openrouter_api_key", "eleven_labs_api_key"]}
+            os.makedirs(os.path.dirname(os.path.abspath(self.config_file)), exist_ok=True)
             with open(self.config_file, 'w') as f:
                 json.dump(config_to_save, f, indent=2)
             logger.info(f"Saved config to {self.config_file}")
+        except PermissionError:
+            logger.warning(f"Permission denied writing to {self.config_file}")
         except Exception as e:
             logger.error(f"Error saving config: {e}")
     
@@ -69,32 +72,42 @@ class ImprovedVoiceInputProcessor:
         self.transcription_method = transcription_method
         if transcription_method == "whisper":
             try:
-                self.whisper_model = whisper.load_model("tiny")
+                self.whisper_model = whisper.load_model("base")
+                logger.info("Whisper model 'base' loaded successfully")
             except Exception as e:
                 logger.error(f"Failed to load Whisper model: {e}")
                 st.error(f"❌ Failed to load Whisper model: {e}")
                 self.whisper_model = None
     
-    def process_uploaded_audio(self, audio_file):
-        """Process audio data from browser-uploaded file"""
+    def process_webm_audio(self, audio_file):
+        """Process WebM audio data from browser recording"""
         try:
             with tempfile.NamedTemporaryFile(delete=False, suffix='.webm') as temp_file:
                 temp_file.write(audio_file.read())
                 temp_file_path = temp_file.name
-            audio_data, sr = librosa.load(temp_file_path, sr=self.sample_rate, mono=True)
+            logger.info(f"Temp file created: {temp_file_path}")
+            wav_path = temp_file_path.replace('.webm', '.wav')
+            AudioSegment.from_file(temp_file_path, format='webm').export(wav_path, format='wav')
+            audio_data, sr = librosa.load(wav_path, sr=self.sample_rate, mono=True)
+            logger.info(f"Audio loaded: {len(audio_data)} samples, sample rate: {sr}")
             os.remove(temp_file_path)
+            os.remove(wav_path)
             audio_data = self._trim_silence(audio_data)
-            logger.info(f"✅ Processed audio - {len(audio_data)/self.sample_rate:.2f} seconds")
+            duration = len(audio_data) / self.sample_rate
+            logger.info(f"✅ Processed audio - {duration:.2f} seconds")
+            if duration < 0.5:
+                logger.warning("Audio duration too short, may affect transcription")
             return audio_data
         except Exception as e:
-            logger.error(f"Error processing uploaded audio: {e}")
+            logger.error(f"Error processing WebM audio: {e}")
             st.error(f"❌ Error processing audio: {e}")
             return None
     
-    def _trim_silence(self, audio, threshold=0.01):
+    def _trim_silence(self, audio, threshold=0.005):
         """Trim silence from audio data"""
         non_silent = np.where(np.abs(audio) > threshold)[0]
         if len(non_silent) == 0:
+            logger.warning("No non-silent audio detected")
             return audio
         start_idx = max(0, non_silent[0] - int(0.1 * self.sample_rate))
         end_idx = min(len(audio), non_silent[-1] + int(0.1 * self.sample_rate))
@@ -122,19 +135,23 @@ class ImprovedVoiceInputProcessor:
     def transcribe_audio(self, audio_data: np.ndarray) -> Optional[str]:
         """Transcribe audio data using Whisper"""
         if audio_data is None or len(audio_data) == 0:
+            logger.warning("No audio data for transcription")
             return None
         try:
             wav_file = self.save_audio_to_wav(audio_data)
             if not wav_file:
+                logger.error("Failed to save audio to WAV")
                 return None
             if self.transcription_method == "whisper" and self.whisper_model:
                 result = self.whisper_model.transcribe(wav_file, language="en")
+                transcribed_text = result["text"].strip()
+                logger.info(f"Transcription result: {transcribed_text}")
                 os.remove(wav_file)
-                return result["text"]
+                return transcribed_text if transcribed_text else None
             else:
                 logger.warning("No valid transcription method available")
                 os.remove(wav_file)
-                return ""
+                return None
         except Exception as e:
             logger.error(f"Transcription error: {e}")
             if os.path.exists(wav_file):
@@ -185,7 +202,7 @@ class EmotionDetector:
         features['energy_skew'] = float(skew(rms.flatten()))
         features['energy_kurtosis'] = float(kurtosis(rms.flatten()))
         
-        silence_threshold = 0.01
+        silence_threshold = 0.005
         silent_frames = rms < silence_threshold
         silence_ratio = float(np.sum(silent_frames) / len(rms))
         features['silence_ratio'] = silence_ratio
@@ -293,11 +310,14 @@ Respond in a warm, natural way, reflecting their possible emotional state if it 
                 "Content-Type": "application/json"
             }
             
-            response = requests.post(self.base_url, json=payload, headers=headers, timeout=10)
+            response = requests.post(self.base_url, json=payload, headers=headers, timeout=20)
+            logger.info(f"OpenRouter response status: {response.status_code}")
             response.raise_for_status()
             
             result = response.json()
-            return result["choices"][0]["message"]["content"].strip()
+            response_text = result["choices"][0]["message"]["content"].strip()
+            logger.info(f"Generated response: {response_text}")
+            return response_text
         except Exception as e:
             logger.error(f"Response generation error: {e}")
             return "I'm here for you—want to chat about what's going on?"
@@ -308,9 +328,9 @@ class TextToSpeechEngine:
     def __init__(self, eleven_labs_api_key=None, voice_id="21m00Tcm4TlvDq8ikWAM"):
         self.eleven_labs_api_key = eleven_labs_api_key
         self.voice_id = voice_id
-        self.max_chars = 5000  # Eleven Labs character limit for free tier
+        self.max_chars = 5000
         self.last_api_call = 0
-        self.min_delay = 1.0  # Minimum delay between API calls to avoid rate limits
+        self.min_delay = 1.0
         logger.info(f"TextToSpeechEngine initialized with voice_id: {voice_id}, API key provided: {bool(eleven_labs_api_key)}")
     
     def _split_text(self, text: str) -> list:
@@ -334,8 +354,7 @@ class TextToSpeechEngine:
     @retry(stop_max_attempt_number=3, wait_exponential_multiplier=1000, wait_exponential_max=10000)
     def _speak_with_eleven_labs(self, text: str) -> bool:
         try:
-            logger.info(f"Attempting to use Eleven Labs API with voice_id: {self.voice_id} for text: {text[:50]}...")
-            # Enforce minimum delay to avoid rate limits
+            logger.info(f"Attempting to use Eleven Labs API for text: {text[:50]}...")
             elapsed = time.time() - self.last_api_call
             if elapsed < self.min_delay:
                 time.sleep(self.min_delay - elapsed)
@@ -358,27 +377,28 @@ class TextToSpeechEngine:
             self.last_api_call = time.time()
             
             if response.status_code == 200:
-                # Save audio to temporary file
                 temp_audio = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
                 temp_audio.write(response.content)
                 temp_audio_path = temp_audio.name
                 temp_audio.close()
                 
-                # Verify audio file size
                 file_size = os.path.getsize(temp_audio_path)
                 logger.info(f"Audio file created: {temp_audio_path}, size: {file_size} bytes")
                 
-                # Play audio
                 with open(temp_audio_path, "rb") as audio_file:
                     st.audio(audio_file, format="audio/mp3", start_time=0)
                 
-                # Clean up
-                os.remove(temp_audio_path)
+                try:
+                    if os.path.exists(temp_audio_path):
+                        os.remove(temp_audio_path)
+                except Exception as e:
+                    logger.warning(f"Failed to cleanup temp audio file: {e}")
+                
                 logger.info("Successfully played audio with Eleven Labs")
                 return True
             else:
                 logger.error(f"Eleven Labs API error: {response.status_code} - {response.text}")
-                st.error(f"❌ Eleven Labs API error: {response.status_code} - {response.text}")
+                st.error(f"❌ Eleven Labs API error: {response.status_code}")
                 return False
         except Exception as e:
             logger.error(f"Error with Eleven Labs API: {str(e)}")
@@ -403,7 +423,6 @@ class TextToSpeechEngine:
         
         logger.info(f"Processing text for TTS: {text}")
         if self.eleven_labs_api_key:
-            # Split text into chunks if necessary
             chunks = self._split_text(text)
             success = True
             for i, chunk in enumerate(chunks):
@@ -629,7 +648,7 @@ def load_css():
         display: flex;
         align-items: center;
         justify-content: center;
-        animation: rotate 10s linearinfinite;
+        animation: rotate 10s linear infinite;
         padding: 8px;
     }
     
@@ -784,21 +803,26 @@ def audio_recorder_component():
 
         async function startRecording() {
             try {
+                console.log('Requesting microphone access...');
                 const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                console.log('Microphone access granted');
                 mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
                 audioChunks = [];
                 
                 mediaRecorder.ondataavailable = event => {
                     if (event.data.size > 0) {
                         audioChunks.push(event.data);
+                        console.log('Audio chunk received, size:', event.data.size);
                     }
                 };
                 
                 mediaRecorder.onstop = () => {
+                    console.log('Recording stopped, chunks:', audioChunks.length);
                     const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+                    console.log('Audio blob created, size:', audioBlob.size);
                     const reader = new FileReader();
                     reader.onload = () => {
-                        // Send base64-encoded audio to Streamlit
+                        console.log('Base64 audio data ready, length:', reader.result.length);
                         window.parent.postMessage({
                             type: 'streamlit:setComponentValue',
                             value: reader.result
@@ -806,13 +830,16 @@ def audio_recorder_component():
                     };
                     reader.readAsDataURL(audioBlob);
                     stream.getTracks().forEach(track => track.stop());
+                    console.log('Audio stream stopped');
                 };
                 
                 mediaRecorder.start();
                 recordButton.disabled = true;
                 stopButton.disabled = false;
                 status.textContent = 'Recording... Speak now!';
+                console.log('Recording started');
             } catch (err) {
+                console.error('Error accessing microphone:', err);
                 status.textContent = 'Error accessing microphone: ' + err.message;
             }
         }
@@ -823,6 +850,7 @@ def audio_recorder_component():
                 recordButton.disabled = false;
                 stopButton.disabled = true;
                 status.textContent = 'Processing audio...';
+                console.log('Recording stopped by user');
             }
         }
 
@@ -830,28 +858,32 @@ def audio_recorder_component():
         stopButton.addEventListener('click', stopRecording);
     </script>
     """
-    return st.components.v1.html(component_html, height=150)
+    return st.components.v1.html(component_html, height=200)
 
 # Streamlit UI
 def main():
     st.set_page_config(page_title="Halo.ai", page_icon="🤖", layout="wide")
     
-    # Load custom CSS
     load_css()
     
-    # Initialize ConfigManager
     if 'config_manager' not in st.session_state:
         st.session_state.config_manager = ConfigManager()
     
-    # Set API keys from Streamlit secrets
     try:
-        st.session_state.config_manager.config["openrouter_api_key"] = st.secrets["openrouter_api_key"]
-        st.session_state.config_manager.config["eleven_labs_api_key"] = st.secrets["eleven_labs_api_key"]
-    except KeyError as e:
-        st.error(f"Missing secret: {e}. Please set the API keys in Streamlit secrets.")
+        openrouter_key = st.secrets.get("openrouter_api_key")
+        eleven_labs_key = st.secrets.get("eleven_labs_api_key")
+        if not openrouter_key:
+            st.error("OpenRouter API key not found in secrets")
+            st.stop()
+        if not eleven_labs_key:
+            st.error("Eleven Labs API key not found in secrets")
+            st.stop()
+        st.session_state.config_manager.config["openrouter_api_key"] = openrouter_key
+        st.session_state.config_manager.config["eleven_labs_api_key"] = eleven_labs_key
+    except Exception as e:
+        st.error(f"Error accessing secrets: {e}")
         st.stop()
     
-    # Initialize session state
     if 'page' not in st.session_state:
         st.session_state.page = 'login'
     if 'companion' not in st.session_state:
@@ -861,19 +893,16 @@ def main():
     if 'audio_data' not in st.session_state:
         st.session_state.audio_data = None
     
-    # Helper function to handle login
     def handle_login():
         try:
             st.session_state.page = 'main'
             logger.info("Login successful, navigating to main page")
-            st.experimental_rerun()
+            st.rerun()
         except Exception as e:
             logger.error(f"Login error: {e}")
             st.error(f"Login failed: {e}")
     
-    # Login Page
     if st.session_state.page == 'login':
-        # Center the content
         st.markdown('<div class="login-container">', unsafe_allow_html=True)
         st.markdown('<div class="login-header">', unsafe_allow_html=True)
         st.markdown('<h1 class="app-title"><span class="app-title-halo">Halo</span><span class="app-title-ai">.AI</span></h1>', unsafe_allow_html=True)
@@ -881,127 +910,118 @@ def main():
         st.markdown('<p class="login-subtitle">Discover the latest 1000+ Voice Effects</p>', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
         
-        # Email button
         if st.button("Continue with Email", key="email_login"):
             handle_login()
         
         st.markdown('<div class="or-divider">or</div>', unsafe_allow_html=True)
         
-        # Social login buttons
         if st.button("Continue with Google", key="google_login"):
             handle_login()
-        
         if st.button("Continue with Apple", key="apple_login"):
             handle_login()
-        
         if st.button("Continue with Facebook", key="facebook_login"):
             handle_login()
-        
         if st.button("Continue with Twitter", key="twitter_login"):
             handle_login()
         
         st.markdown('<a href="#" class="link-text">Already Have an Account ? Sign in</a>', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
     
-    # Main Interaction Page
     elif st.session_state.page == 'main':
         try:
-            # Initialize components only when needed
             if 'audio_processor' not in st.session_state:
                 st.session_state.audio_processor = ImprovedVoiceInputProcessor(
                     transcription_method=st.session_state.config_manager.get("transcription_method", "whisper")
                 )
-            
+        except Exception as e:
+            logger.error(f"Failed to initialize audio processor: {e}")
+            st.error("Failed to initialize audio processor. Please refresh the page.")
+            st.stop()
+        
+        try:
             if st.session_state.companion is None:
                 with st.spinner("Initializing AI companion..."):
                     st.session_state.companion = EmotionalAICompanion(
                         st.session_state.config_manager.get("openrouter_api_key"),
                         st.session_state.config_manager
                     )
-            
-            # Render the main page
-            st.markdown('<div class="main-container">', unsafe_allow_html=True)
-            
-            # AI Avatar with animated border
-            st.markdown('''
-            <div class="ai-avatar">
-                <div class="ai-avatar-inner">
-                    <div class="ai-avatar-face">
-                        👨
-                    </div>
+        except Exception as e:
+            logger.error(f"Failed to initialize AI companion: {e}")
+            st.error("Failed to initialize AI companion. Please check your API keys.")
+            st.stop()
+        
+        st.markdown('<div class="main-container">', unsafe_allow_html=True)
+        
+        st.markdown('''
+        <div class="ai-avatar">
+            <div class="ai-avatar-inner">
+                <div class="ai-avatar-face">
+                    👨
                 </div>
             </div>
-            ''', unsafe_allow_html=True)
-            
-            # Audio recording component
-            col1, col2, col3 = st.columns([1, 1, 1])
-            with col2:
-                audio_component = audio_recorder_component()
-            
-            # Process recorded audio
-            if audio_component and isinstance(audio_component, str) and audio_component.startswith('data:audio/webm'):
-                with st.spinner("Processing audio..."):
-                    try:
-                        # Decode base64 audio
-                        audio_base64 = audio_component.split(',')[1]
-                        audio_bytes = BytesIO(base64.b64decode(audio_base64))
-                        audio_data = st.session_state.audio_processor.process_uploaded_audio(audio_bytes)
-                        st.session_state.audio_data = None  # Clear after processing
-                        
-                        if audio_data is not None:
-                            transcribed_text = st.session_state.audio_processor.transcribe_audio(audio_data)
-                            if transcribed_text:
-                                logger.info(f"Transcribed text: {transcribed_text}")
-                                interaction = st.session_state.companion.process_audio(audio_data, transcribed_text)
-                                if interaction:
-                                    logger.info(f"User said: {interaction['user_input']}, AI responded: {interaction['ai_response']}")
-                                    st.success(f"You said: {transcribed_text}")
-                                    st.info(f"AI: {interaction['ai_response']}")
-                                else:
-                                    logger.warning("No interaction returned from process_audio")
-                                    st.warning("No response generated")
-                            else:
-                                logger.warning("Transcription returned empty text")
-                                st.warning("⚠️ Could not transcribe audio. Please try again.")
-                        else:
-                            st.error("❌ No audio captured. Please try again.")
-                        
-                        time.sleep(1)
-                        st.experimental_rerun()
+        </div>
+        ''', unsafe_allow_html=True)
+        
+        col1, col2, col3 = st.columns([1, 1, 1])
+        with col2:
+            audio_component = audio_recorder_component()
+        
+        if audio_component and isinstance(audio_component, str) and audio_component.startswith('data:audio/webm'):
+            logger.info(f"Received audio component: {audio_component[:50]}...")
+            with st.spinner("Processing audio..."):
+                try:
+                    audio_base64 = audio_component.split(',')[1]
+                    audio_bytes = BytesIO(base64.b64decode(audio_base64))
+                    audio_data = st.session_state.audio_processor.process_webm_audio(audio_bytes)
+                    st.session_state.audio_data = None
                     
-                    except Exception as e:
-                        logger.error(f"Processing error: {e}")
-                        st.error(f"Processing failed: {e}")
-                        st.session_state.audio_data = None
-                        st.experimental_rerun()
-            
-            # Fallback to text input
-            st.warning("⚠️ If audio recording fails, enter text to interact.")
-            user_text = st.text_input("Enter your message:", key="text_input")
-            if user_text:
-                # Use dummy audio data for emotion detection
-                dummy_audio = np.array([], dtype=np.float32)
-                interaction = st.session_state.companion.process_audio(dummy_audio, user_text)
-                if interaction:
-                    st.success(f"You said: {user_text}")
-                    st.info(f"AI: {interaction['ai_response']}")
-                st.experimental_rerun()
-            
-            st.markdown('</div>', unsafe_allow_html=True)
-            
-        except Exception as e:
-            logger.error(f"Main page error: {e}")
-            st.error(f"Page loading failed: {e}")
-            if st.button("Back to Login"):
-                st.session_state.page = 'login'
-                st.experimental_rerun()
+                    if audio_data is not None:
+                        logger.info(f"Audio data shape: {audio_data.shape}")
+                        transcribed_text = st.session_state.audio_processor.transcribe_audio(audio_data)
+                        logger.info(f"Transcribed text: {transcribed_text}")
+                        if transcribed_text:
+                            interaction = st.session_state.companion.process_audio(audio_data, transcribed_text)
+                            if interaction:
+                                logger.info(f"User said: {interaction['user_input']}, AI responded: {interaction['ai_response']}")
+                                st.success(f"You said: {transcribed_text}")
+                                st.info(f"AI: {interaction['ai_response']}")
+                            else:
+                                logger.warning("No interaction returned from process_audio")
+                                st.warning("No response generated")
+                        else:
+                            logger.warning("Transcription returned empty text")
+                            st.warning("⚠️ Could not transcribe audio. Please try again.")
+                    else:
+                        logger.error("No audio data processed")
+                        st.error("❌ No audio captured. Please try again.")
+                    
+                    logger.info("Audio processed, triggering rerun")
+                    time.sleep(1)
+                    st.rerun()
+                
+                except Exception as e:
+                    logger.error(f"Audio processing error: {e}")
+                    st.error(f"Processing failed: {e}")
+                    st.session_state.audio_data = None
+                    st.rerun()
+        
+        st.warning("⚠️ If audio recording fails, enter text to interact.")
+        user_text = st.text_input("Enter your message:", key="text_input")
+        if user_text:
+            dummy_audio = np.array([], dtype=np.float32)
+            interaction = st.session_state.companion.process_audio(dummy_audio, user_text)
+            if interaction:
+                st.success(f"You said: {user_text}")
+                st.info(f"AI: {interaction['ai_response']}")
+            st.rerun()
+        
+        st.markdown('</div>', unsafe_allow_html=True)
     
     else:
-        # Fallback - should not happen but just in case
         st.error("Unknown page state")
         if st.button("Go to Login"):
             st.session_state.page = 'login'
-            st.experimental_rerun()
+            st.rerun()
 
 if __name__ == "__main__":
     main()
