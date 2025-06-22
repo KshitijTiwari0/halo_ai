@@ -5,7 +5,6 @@ import logging
 from datetime import datetime
 from typing import Dict, Optional
 import streamlit as st
-import sounddevice as sd
 import numpy as np
 import wave
 import tempfile
@@ -15,6 +14,7 @@ import requests
 import pyttsx3
 from scipy.stats import skew, kurtosis
 from retrying import retry
+from io import BytesIO
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -73,91 +73,25 @@ class ImprovedVoiceInputProcessor:
                 logger.error(f"Failed to load Whisper model: {e}")
                 st.error(f"❌ Failed to load Whisper model: {e}")
                 self.whisper_model = None
-        self._test_microphone_setup()
     
-    def _test_microphone_setup(self):
+    def process_uploaded_audio(self, audio_file):
+        """Process audio data from browser-uploaded file"""
         try:
-            devices = sd.query_devices()
-            input_devices = [d for d in devices if d['max_input_channels'] > 0]
-            if not input_devices:
-                logger.error("No input devices found")
-                st.error("❌ No microphone devices found")
-                return False
-            logger.info(f"Found {len(input_devices)} input device(s)")
-            return True
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_file:
+                temp_file.write(audio_file.read())
+                temp_file_path = temp_file.name
+            audio_data, sr = librosa.load(temp_file_path, sr=self.sample_rate, mono=True)
+            os.remove(temp_file_path)
+            audio_data = self._trim_silence(audio_data)
+            logger.info(f"✅ Processed audio - {len(audio_data)/self.sample_rate:.2f} seconds")
+            return audio_data
         except Exception as e:
-            logger.error(f"Microphone setup error: {e}")
-            st.error(f"❌ Microphone setup failed: {e}")
-            return False
-    
-    def _apply_pre_emphasis(self, audio, alpha=0.97):
-        return np.append(audio[0], audio[1:] - alpha * audio[:-1])
-    
-    def _estimate_noise_level(self, audio, window_size=0.1):
-        window_samples = int(window_size * self.sample_rate)
-        if len(audio) < window_samples:
-            return 0.01
-        chunks = [audio[i:i + window_samples] for i in range(0, len(audio), window_samples)]
-        rms_values = [np.sqrt(np.mean(chunk**2)) for chunk in chunks if len(chunk) == window_samples]
-        return np.median(rms_values) if rms_values else 0.01
-    
-    def record_audio_with_vad(self, max_duration=10, silence_threshold=0.01, silence_duration=2):
-        try:
-            logger.info("🎤 Starting recording with VAD...")
-            buffer_size = int(self.sample_rate * 0.1)
-            audio_buffer = []
-            silence_counter = 0
-            max_silence_chunks = int(silence_duration / 0.1)
-            initial_noise_level = None
-            
-            def audio_callback(indata, frames, time, status):
-                if status:
-                    logger.warning(f"Audio callback status: {status}")
-                processed_audio = self._apply_pre_emphasis(indata.flatten())
-                nonlocal initial_noise_level
-                if initial_noise_level is None:
-                    initial_noise_level = self._estimate_noise_level(processed_audio)
-                dynamic_threshold = max(silence_threshold, initial_noise_level * 1.5)
-                rms = np.sqrt(np.mean(processed_audio**2))
-                audio_buffer.extend(processed_audio)
-                nonlocal silence_counter
-                if rms > dynamic_threshold:
-                    silence_counter = 0
-                else:
-                    silence_counter += 1
-                if (silence_counter >= max_silence_chunks and 
-                    len(audio_buffer) > self.sample_rate):
-                    raise sd.CallbackStop()
-            
-            with sd.InputStream(
-                samplerate=self.sample_rate,
-                channels=self.channels,
-                callback=audio_callback,
-                blocksize=buffer_size,
-                dtype=np.float32
-            ):
-                time.sleep(max_duration)
-            if not audio_buffer:
-                logger.warning("No audio data captured")
-                return None
-            audio_array = np.array(audio_buffer, dtype=np.float32)
-            audio_array = self._trim_silence(audio_array, threshold=silence_threshold)
-            logger.info(f"✅ Recorded {len(audio_array)/self.sample_rate:.2f} seconds of audio")
-            return audio_array
-        except sd.CallbackStop:
-            if audio_buffer:
-                audio_array = np.array(audio_buffer, dtype=np.float32)
-                audio_array = self._trim_silence(audio_array, threshold=silence_threshold)
-                logger.info(f"✅ Recording stopped by VAD - {len(audio_array)/self.sample_rate:.2f} seconds")
-                return audio_array
-            else:
-                logger.warning("Recording stopped but no audio captured")
-                return None
-        except Exception as e:
-            logger.error(f"Recording error: {e}")
+            logger.error(f"Error processing uploaded audio: {e}")
+            st.error(f"❌ Error processing audio: {e}")
             return None
     
     def _trim_silence(self, audio, threshold=0.01):
+        """Trim silence from audio data"""
         non_silent = np.where(np.abs(audio) > threshold)[0]
         if len(non_silent) == 0:
             return audio
@@ -166,6 +100,7 @@ class ImprovedVoiceInputProcessor:
         return audio[start_idx:end_idx]
     
     def save_audio_to_wav(self, audio_data, filename=None):
+        """Save audio data to WAV file"""
         if filename is None:
             temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
             filename = temp_file.name
@@ -184,6 +119,7 @@ class ImprovedVoiceInputProcessor:
             return None
     
     def transcribe_audio(self, audio_data: np.ndarray) -> Optional[str]:
+        """Transcribe audio data using Whisper"""
         if audio_data is None or len(audio_data) == 0:
             return None
         try:
@@ -788,8 +724,112 @@ def load_css():
             font-size: 2rem;
         }
     }
+    
+    /* Audio recording button */
+    #recordButton, #stopButton {
+        background: #10B981;
+        border: none;
+        border-radius: 50%;
+        width: 60px;
+        height: 60px;
+        font-size: 1.5rem;
+        color: white;
+        margin: 1rem;
+        cursor: pointer;
+        box-shadow: 0 4px 20px rgba(16, 185, 129, 0.3);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+    
+    #recordButton:hover, #stopButton:hover {
+        background: #059669;
+        transform: scale(1.05);
+    }
+    
+    #recordButton:disabled, #stopButton:disabled {
+        background: #555;
+        cursor: not-allowed;
+        transform: none;
+        box-shadow: none;
+    }
+    
+    /* Status message */
+    #status {
+        color: white;
+        font-size: 1rem;
+        margin-top: 1rem;
+    }
     </style>
     """, unsafe_allow_html=True)
+
+# JavaScript for Audio Recording
+def audio_recorder_component():
+    """Embed JavaScript for browser-based audio recording"""
+    component_html = """
+    <div style="text-align: center;">
+        <button id="recordButton">🎙️</button>
+        <button id="stopButton" disabled>🛑</button>
+        <div id="status">Press the microphone to start recording</div>
+        <input type="file" id="audioFile" accept="audio/*" style="display: none;">
+    </div>
+    <script>
+        let mediaRecorder;
+        let audioChunks = [];
+        const recordButton = document.getElementById('recordButton');
+        const stopButton = document.getElementById('stopButton');
+        const status = document.getElementById('status');
+        const audioFileInput = document.getElementById('audioFile');
+
+        async function startRecording() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+                audioChunks = [];
+                
+                mediaRecorder.ondataavailable = event => {
+                    if (event.data.size > 0) {
+                        audioChunks.push(event.data);
+                    }
+                };
+                
+                mediaRecorder.onstop = () => {
+                    const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+                    const reader = new FileReader();
+                    reader.onload = () => {
+                        // Send base64-encoded audio to Streamlit
+                        window.parent.postMessage({
+                            type: 'streamlit:setComponentValue',
+                            value: reader.result
+                        }, '*');
+                    };
+                    reader.readAsDataURL(audioBlob);
+                    stream.getTracks().forEach(track => track.stop());
+                };
+                
+                mediaRecorder.start();
+                recordButton.disabled = true;
+                stopButton.disabled = false;
+                status.textContent = 'Recording... Speak now!';
+            } catch (err) {
+                status.textContent = 'Error accessing microphone: ' + err.message;
+            }
+        }
+
+        function stopRecording() {
+            if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+                mediaRecorder.stop();
+                recordButton.disabled = false;
+                stopButton.disabled = true;
+                status.textContent = 'Processing audio...';
+            }
+        }
+
+        recordButton.addEventListener('click', startRecording);
+        stopButton.addEventListener('click', stopRecording);
+    </script>
+    """
+    return st.components.v1.html(component_html, height=150)
 
 # Streamlit UI
 def main():
@@ -817,6 +857,8 @@ def main():
         st.session_state.companion = None
     if 'recording_active' not in st.session_state:
         st.session_state.recording_active = False
+    if 'audio_data' not in st.session_state:
+        st.session_state.audio_data = None
     
     # Helper function to handle login
     def handle_login():
@@ -890,21 +932,20 @@ def main():
             </div>
             ''', unsafe_allow_html=True)
             
-            # Record button
+            # Audio recording component
             col1, col2, col3 = st.columns([1, 1, 1])
             with col2:
-                if st.button("🎙️", key="record_button", disabled=st.session_state.recording_active):
-                    st.session_state.recording_active = True
-                    st.experimental_rerun()
+                audio_component = audio_recorder_component()
             
-            if st.session_state.recording_active:
-                with st.spinner("Recording... Speak now!"):
+            # Process recorded audio
+            if audio_component and isinstance(audio_component, str) and audio_component.startswith('data:audio/webm'):
+                with st.spinner("Processing audio..."):
                     try:
-                        audio_data = st.session_state.audio_processor.record_audio_with_vad(
-                            max_duration=st.session_state.config_manager.get("max_duration", 10),
-                            silence_threshold=st.session_state.config_manager.get("silence_threshold", 0.01)
-                        )
-                        st.session_state.recording_active = False
+                        # Decode base64 audio
+                        audio_base64 = audio_component.split(',')[1]
+                        audio_bytes = BytesIO(base64.b64decode(audio_base64))
+                        audio_data = st.session_state.audio_processor.process_uploaded_audio(audio_bytes)
+                        st.session_state.audio_data = None  # Clear after processing
                         
                         if audio_data is not None:
                             transcribed_text = st.session_state.audio_processor.transcribe_audio(audio_data)
@@ -922,16 +963,28 @@ def main():
                                 logger.warning("Transcription returned empty text")
                                 st.warning("⚠️ Could not transcribe audio. Please try again.")
                         else:
-                            st.error("❌ No audio captured. Check your microphone.")
+                            st.error("❌ No audio captured. Please try again.")
                         
                         time.sleep(1)
                         st.experimental_rerun()
-                        
+                    
                     except Exception as e:
-                        logger.error(f"Recording error: {e}")
-                        st.error(f"Recording failed: {e}")
-                        st.session_state.recording_active = False
+                        logger.error(f"Processing error: {e}")
+                        st.error(f"Processing failed: {e}")
+                        st.session_state.audio_data = None
                         st.experimental_rerun()
+            
+            # Fallback to text input
+            st.warning("⚠️ If audio recording fails, enter text to interact.")
+            user_text = st.text_input("Enter your message:", key="text_input")
+            if user_text:
+                # Use dummy audio data for emotion detection
+                dummy_audio = np.array([], dtype=np.float32)
+                interaction = st.session_state.companion.process_audio(dummy_audio, user_text)
+                if interaction:
+                    st.success(f"You said: {user_text}")
+                    st.info(f"AI: {interaction['ai_response']}")
+                st.experimental_rerun()
             
             st.markdown('</div>', unsafe_allow_html=True)
             
