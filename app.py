@@ -15,6 +15,7 @@ import pyttsx3
 from scipy.stats import skew, kurtosis
 from retrying import retry
 from io import BytesIO
+import base64
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -77,7 +78,7 @@ class ImprovedVoiceInputProcessor:
     def process_uploaded_audio(self, audio_file):
         """Process audio data from browser-uploaded file"""
         try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_file:
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.webm') as temp_file:
                 temp_file.write(audio_file.read())
                 temp_file_path = temp_file.name
             audio_data, sr = librosa.load(temp_file_path, sr=self.sample_rate, mono=True)
@@ -628,7 +629,7 @@ def load_css():
         display: flex;
         align-items: center;
         justify-content: center;
-        animation: rotate 10s linear infinite;
+        animation: rotate 10s linearinfinite;
         padding: 8px;
     }
     
