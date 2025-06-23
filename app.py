@@ -96,7 +96,9 @@ class ImprovedVoiceInputProcessor:
             duration = len(audio_data) / self.sample_rate
             logger.info(f"✅ Processed audio - {duration:.2f} seconds")
             if duration < 0.5:
-                logger.warning("Audio duration too short, may affect transcription")
+                logger.warning("Audio duration too short (<0.5s), may affect transcription")
+                st.warning("⚠️ Audio too short. Please speak for at least 1 second.")
+                return None
             return audio_data
         except Exception as e:
             logger.error(f"Error processing WebM audio: {e}")
@@ -105,6 +107,9 @@ class ImprovedVoiceInputProcessor:
     
     def _trim_silence(self, audio, threshold=0.005):
         """Trim silence from audio data"""
+        if len(audio) == 0:
+            logger.warning("Empty audio data received")
+            return audio
         non_silent = np.where(np.abs(audio) > threshold)[0]
         if len(non_silent) == 0:
             logger.warning("No non-silent audio detected")
@@ -167,6 +172,7 @@ class EmotionDetector:
     def detect_emotion(self, audio_data: np.ndarray, sample_rate: int = 16000) -> Dict:
         try:
             if len(audio_data) == 0:
+                logger.warning("Empty audio data received for emotion detection")
                 return {"features": {}, "description": "No audio data"}
             features = self._extract_features(audio_data, sample_rate)
             description = self._describe_features(features)
@@ -249,19 +255,19 @@ class EmotionDetector:
     
     def _describe_features(self, features: Dict) -> str:
         description = "Audio Features:\n"
-        description += f"- Duration: {features['duration']:.2f} seconds\n"
-        description += f"- Pitch: mean={features['pitch_mean']:.2f} Hz, std={features['pitch_std']:.2f} Hz, skew={features['pitch_skew']:.2f}, kurtosis={features['pitch_kurtosis']:.2f}\n"
-        description += f"- Energy: mean={features['energy_mean']:.4f}, std={features['energy_std']:.4f}, skew={features['energy_skew']:.2f}, kurtosis={features['energy_kurtosis']:.2f}\n"
-        description += f"- Silence Ratio: {features['silence_ratio']:.2f}\n"
-        description += f"- Tempo: {features['tempo']:.2f} BPM\n"
-        description += f"- MFCC Means: " + ", ".join([f"mfcc_{i}: {features[f'mfcc_{i}_mean']:.2f}" for i in range(13)]) + "\n"
-        description += f"- Chroma: mean={features['chroma_mean']:.4f}, std={features['chroma_std']:.4f}\n"
-        description += f"- Spectral Centroid: mean={features['spectral_centroid_mean']:.2f} Hz, std={features['spectral_centroid_std']:.2f} Hz\n"
-        description += f"- Spectral Bandwidth: mean={features['spectral_bandwidth_mean']:.2f} Hz, std={features['spectral_bandwidth_std']:.2f} Hz\n"
-        description += f"- Spectral Flatness: mean={features['spectral_flatness_mean']:.4f}, std={features['spectral_flatness_std']:.4f}\n"
-        description += f"- Spectral Rolloff: mean={features['spectral_rolloff_mean']:.2f} Hz, std={features['spectral_rolloff_std']:.2f} Hz\n"
-        description += f"- Zero-Crossing Rate: mean={features['zcr_mean']:.4f}, std={features['zcr_std']:.4f}\n"
-        description += f"- Short-Term Energy: mean={features['ste_mean']:.4f}, std={features['ste_std']:.4f}\n"
+        description += f"- Duration: {features.get('duration', 0):.2f} seconds\n"
+        description += f"- Pitch: mean={features.get('pitch_mean', 0):.2f} Hz, std={features.get('pitch_std', 0):.2f} Hz, skew={features.get('pitch_skew', 0):.2f}, kurtosis={features.get('pitch_kurtosis', 0):.2f}\n"
+        description += f"- Energy: mean={features.get('energy_mean', 0):.4f}, std={features.get('energy_std', 0):.4f}, skew={features.get('energy_skew', 0):.2f}, kurtosis={features.get('energy_kurtosis', 0):.2f}\n"
+        description += f"- Silence Ratio: {features.get('silence_ratio', 0):.2f}\n"
+        description += f"- Tempo: {features.get('tempo', 0):.2f} BPM\n"
+        description += f"- MFCC Means: " + ", ".join([f"mfcc_{i}: {features.get(f'mfcc_{i}_mean', 0):.2f}" for i in range(13)]) + "\n"
+        description += f"- Chroma: mean={features.get('chroma_mean', 0):.4f}, std={features.get('chroma_std', 0):.4f}\n"
+        description += f"- Spectral Centroid: mean={features.get('spectral_centroid_mean', 0):.2f} Hz, std={features.get('spectral_centroid_std', 0):.2f} Hz\n"
+        description += f"- Spectral Bandwidth: mean={features.get('spectral_bandwidth_mean', 0):.2f} Hz, std={features.get('spectral_bandwidth_std', 0):.2f} Hz\n"
+        description += f"- Spectral Flatness: mean={features.get('spectral_flatness_mean', 0):.4f}, std={features.get('spectral_flatness_std', 0):.4f}\n"
+        description += f"- Spectral Rolloff: mean={features.get('spectral_rolloff_mean', 0):.2f} Hz, std={features.get('spectral_rolloff_std', 0):.2f} Hz\n"
+        description += f"- Zero-Crossing Rate: mean={features.get('zcr_mean', 0):.4f}, std={features.get('zcr_std', 0):.4f}\n"
+        description += f"- Short-Term Energy: mean={features.get('ste_mean', 0):.4f}, std={features.get('ste_std', 0):.4f}\n"
         if 'speaking_rate' in features:
             description += f"- Speaking Rate: {features['speaking_rate']:.2f} words per minute\n"
         return description
@@ -461,7 +467,11 @@ class EmotionalAICompanion:
             emotion_result = self.emotion_detector.detect_emotion(audio_data)
             features = emotion_result["features"]
             
-            if transcribed_text and features['duration'] > 0:
+            if not features:
+                logger.error("No features extracted from audio")
+                return None
+            
+            if transcribed_text and features.get('duration', 0) > 0:
                 num_words = len(transcribed_text.split())
                 speaking_rate = num_words / features['duration'] * 60
                 features['speaking_rate'] = float(speaking_rate)
@@ -897,7 +907,7 @@ def main():
         try:
             st.session_state.page = 'main'
             logger.info("Login successful, navigating to main page")
-            st.rerun()
+            st.experimental_rerun()
         except Exception as e:
             logger.error(f"Login error: {e}")
             st.error(f"Login failed: {e}")
@@ -997,13 +1007,13 @@ def main():
                     
                     logger.info("Audio processed, triggering rerun")
                     time.sleep(1)
-                    st.rerun()
+                    st.experimental_rerun()
                 
                 except Exception as e:
                     logger.error(f"Audio processing error: {e}")
                     st.error(f"Processing failed: {e}")
                     st.session_state.audio_data = None
-                    st.rerun()
+                    st.experimental_rerun()
         
         st.warning("⚠️ If audio recording fails, enter text to interact.")
         user_text = st.text_input("Enter your message:", key="text_input")
@@ -1013,7 +1023,7 @@ def main():
             if interaction:
                 st.success(f"You said: {user_text}")
                 st.info(f"AI: {interaction['ai_response']}")
-            st.rerun()
+            st.experimental_rerun()
         
         st.markdown('</div>', unsafe_allow_html=True)
     
@@ -1021,7 +1031,7 @@ def main():
         st.error("Unknown page state")
         if st.button("Go to Login"):
             st.session_state.page = 'login'
-            st.rerun()
+            st.experimental_rerun()
 
 if __name__ == "__main__":
     main()
