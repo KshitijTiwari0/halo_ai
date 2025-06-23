@@ -66,24 +66,29 @@ class ConfigManager:
 # Voice Input Processor
 class ImprovedVoiceInputProcessor:
     """Handles audio recording and transcription"""
+    _whisper_model = None  # Class-level cache to avoid reloading
+
     def __init__(self, sample_rate=16000, channels=1, transcription_method="whisper"):
         self.sample_rate = sample_rate
         self.channels = channels
         self.transcription_method = transcription_method
         if transcription_method == "whisper":
-            try:
-                self.whisper_model = whisper.load_model("base")
-                logger.info("Whisper model 'base' loaded successfully")
-            except Exception as e:
-                logger.error(f"Failed to load Whisper model: {e}")
-                st.error(f"❌ Failed to load Whisper model: {e}")
-                self.whisper_model = None
+            if ImprovedVoiceInputProcessor._whisper_model is None:
+                try:
+                    ImprovedVoiceInputProcessor._whisper_model = whisper.load_model("base")
+                    logger.info("Whisper model 'base' loaded successfully")
+                except Exception as e:
+                    logger.error(f"Failed to load Whisper model: {e}")
+                    st.error(f"❌ Failed to load Whisper model: {e}")
+            self.whisper_model = ImprovedVoiceInputProcessor._whisper_model
     
     def process_webm_audio(self, audio_file):
         """Process WebM audio data from browser recording"""
         try:
             with tempfile.NamedTemporaryFile(delete=False, suffix='.webm') as temp_file:
-                temp_file.write(audio_file.read())
+                audio_bytes = audio_file.read()
+                logger.info(f"Audio file size: {len(audio_bytes)} bytes")
+                temp_file.write(audio_bytes)
                 temp_file_path = temp_file.name
             logger.info(f"Temp file created: {temp_file_path}")
             wav_path = temp_file_path.replace('.webm', '.wav')
@@ -316,6 +321,7 @@ Respond in a warm, natural way, reflecting their possible emotional state if it 
                 "Content-Type": "application/json"
             }
             
+            logger.info("Sending request to OpenRouter API")
             response = requests.post(self.base_url, json=payload, headers=headers, timeout=20)
             logger.info(f"OpenRouter response status: {response.status_code}")
             response.raise_for_status()
@@ -326,6 +332,7 @@ Respond in a warm, natural way, reflecting their possible emotional state if it 
             return response_text
         except Exception as e:
             logger.error(f"Response generation error: {e}")
+            st.error(f"❌ Response generation failed: {e}")
             return "I'm here for you—want to chat about what's going on?"
 
 # Text-to-Speech Engine
@@ -830,6 +837,11 @@ def audio_recorder_component():
                     console.log('Recording stopped, chunks:', audioChunks.length);
                     const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
                     console.log('Audio blob created, size:', audioBlob.size);
+                    if (audioBlob.size === 0) {
+                        console.error('Audio blob is empty');
+                        status.textContent = 'Error: No audio recorded';
+                        return;
+                    }
                     const reader = new FileReader();
                     reader.onload = () => {
                         console.log('Base64 audio data ready, length:', reader.result.length);
@@ -976,46 +988,77 @@ def main():
         with col2:
             audio_component = audio_recorder_component()
         
-        if audio_component and isinstance(audio_component, str) and audio_component.startswith('data:audio/webm'):
-            logger.info(f"Received audio component: {audio_component[:50]}...")
-            with st.spinner("Processing audio..."):
-                try:
-                    audio_base64 = audio_component.split(',')[1]
-                    audio_bytes = BytesIO(base64.b64decode(audio_base64))
-                    audio_data = st.session_state.audio_processor.process_webm_audio(audio_bytes)
-                    st.session_state.audio_data = None
-                    
-                    if audio_data is not None:
-                        logger.info(f"Audio data shape: {audio_data.shape}")
-                        transcribed_text = st.session_state.audio_processor.transcribe_audio(audio_data)
-                        logger.info(f"Transcribed text: {transcribed_text}")
-                        if transcribed_text:
-                            interaction = st.session_state.companion.process_audio(audio_data, transcribed_text)
-                            if interaction:
-                                logger.info(f"User said: {interaction['user_input']}, AI responded: {interaction['ai_response']}")
-                                st.success(f"You said: {transcribed_text}")
-                                st.info(f"AI: {interaction['ai_response']}")
+        if audio_component:
+            logger.info(f"Audio component received, type: {type(audio_component)}, starts with data:audio/webm: {isinstance(audio_component, str) and audio_component.startswith('data:audio/webm')}")
+            if isinstance(audio_component, str) and audio_component.startswith('data:audio/webm'):
+                logger.info(f"Processing audio component: {audio_component[:50]}...")
+                with st.spinner("Processing audio..."):
+                    try:
+                        audio_base64 = audio_component.split(',')[1]
+                        audio_bytes = BytesIO(base64.b64decode(audio_base64))
+                        audio_data = st.session_state.audio_processor.process_webm_audio(audio_bytes)
+                        st.session_state.audio_data = None
+                        
+                        if audio_data is not None:
+                            logger.info(f"Audio data shape: {audio_data.shape}")
+                            transcribed_text = st.session_state.audio_processor.transcribe_audio(audio_data)
+                            logger.info(f"Transcribed text: {transcribed_text}")
+                            if transcribed_text:
+                                interaction = st.session_state.companion.process_audio(audio_data, transcribed_text)
+                                if interaction:
+                                    logger.info(f"User said: {interaction['user_input']}, AI responded: {interaction['ai_response']}")
+                                    st.success(f"You said: {transcribed_text}")
+                                    st.info(f"AI: {interaction['ai_response']}")
+                                else:
+                                    logger.warning("No interaction returned from process_audio")
+                                    st.warning("No response generated")
                             else:
-                                logger.warning("No interaction returned from process_audio")
-                                st.warning("No response generated")
+                                logger.warning("Transcription returned empty text")
+                                st.warning("⚠️ Could not transcribe audio. Please try again.")
                         else:
-                            logger.warning("Transcription returned empty text")
-                            st.warning("⚠️ Could not transcribe audio. Please try again.")
-                    else:
-                        logger.error("No audio data processed")
-                        st.error("❌ No audio captured. Please try again.")
+                            logger.error("No audio data processed")
+                            st.error("❌ No audio captured. Please try again.")
+                        
+                        logger.info("Audio processed, triggering rerun")
+                        time.sleep(1)
+                        st.experimental_rerun()
                     
-                    logger.info("Audio processed, triggering rerun")
-                    time.sleep(1)
-                    st.experimental_rerun()
-                
-                except Exception as e:
-                    logger.error(f"Audio processing error: {e}")
-                    st.error(f"Processing failed: {e}")
-                    st.session_state.audio_data = None
-                    st.experimental_rerun()
+                    except Exception as e:
+                        logger.error(f"Audio processing error: {e}")
+                        st.error(f"Processing failed: {e}")
+                        st.session_state.audio_data = None
+                        st.experimental_rerun()
+            else:
+                logger.warning("Invalid audio component received")
+                st.warning("⚠️ Invalid audio data. Please try recording again.")
         
-        st.warning("⚠️ If audio recording fails, enter text to interact.")
+        # Fallback manual audio upload for debugging
+        with col2:
+            uploaded_audio = st.file_uploader("Upload audio file (WAV/WebM) for testing", type=["wav", "webm"])
+            if uploaded_audio:
+                logger.info(f"Uploaded audio file: {uploaded_audio.name}")
+                with st.spinner("Processing uploaded audio..."):
+                    try:
+                        audio_data = st.session_state.audio_processor.process_webm_audio(uploaded_audio)
+                        if audio_data is not None:
+                            transcribed_text = st.session_state.audio_processor.transcribe_audio(audio_data)
+                            if transcribed_text:
+                                interaction = st.session_state.companion.process_audio(audio_data, transcribed_text)
+                                if interaction:
+                                    st.success(f"You said: {transcribed_text}")
+                                    st.info(f"AI: {interaction['ai_response']}")
+                                else:
+                                    st.warning("No response generated")
+                            else:
+                                st.warning("⚠️ Could not transcribe uploaded audio.")
+                        else:
+                            st.error("❌ No audio data processed from upload.")
+                        st.experimental_rerun()
+                    except Exception as e:
+                        logger.error(f"Uploaded audio processing error: {e}")
+                        st.error(f"Processing uploaded audio failed: {e}")
+        
+        st.warning("⚠️ If audio recording fails, enter text to interact or upload an audio file.")
         user_text = st.text_input("Enter your message:", key="text_input")
         if user_text:
             dummy_audio = np.array([], dtype=np.float32)
@@ -1024,6 +1067,12 @@ def main():
                 st.success(f"You said: {user_text}")
                 st.info(f"AI: {interaction['ai_response']}")
             st.experimental_rerun()
+        
+        # Test TTS directly
+        with col2:
+            if st.button("Test TTS"):
+                logger.info("Testing TTS with sample text")
+                st.session_state.companion.tts_engine.speak_text("Hello, this is a test of the text-to-speech system.")
         
         st.markdown('</div>', unsafe_allow_html=True)
     
